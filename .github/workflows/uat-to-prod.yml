@@ -1,4 +1,4 @@
-name: 3. Promote UAT → PROD
+name: 4.Promote UAT → PROD
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         type: number
       source_branch:
-        description: "Source branch: uat"
+        description: "Source branch (UAT)"
         required: true
         type: choice
         options:
@@ -63,7 +63,7 @@ jobs:
           fi
 
           if [ "$BASE_BRANCH" != "uat" ]; then
-            echo "Error: PR #$PR must have been merged into uat (found: $BASE_BRANCH)." >&2
+            echo "Error: PR #$PR must have been merged into UAT (found: $BASE_BRANCH)." >&2
             exit 1
           fi
 
@@ -76,20 +76,22 @@ jobs:
           COMMIT="${{ steps.validate.outputs.merge_commit }}"
 
           if ! git merge-base --is-ancestor "$COMMIT" origin/uat; then
-            echo "Error: The merge commit does not exist in uat branch."
+            echo "Error: The specified PR merge commit does not exist in UAT branch."
             exit 1
           fi
 
-      - name: Extract UAT merge commit changes
+      - name: Extract PR changes
         id: extract
         run: |
-          MERGE="${{ steps.validate.outputs.merge_commit }}"
-          PARENT_UAT=$(git log --pretty=%P -n 1 "$MERGE" | awk '{print $1}')
+          UAT_MERGE="${{ steps.validate.outputs.merge_commit }}"
+          PARENT_UAT=$(git rev-parse "${UAT_MERGE}^1")
 
-          echo "uat_merge_commit=$MERGE" >> $GITHUB_OUTPUT
+          # Apply only the PR changes (diff between parent and merge commit)
           echo "parent_uat=$PARENT_UAT" >> $GITHUB_OUTPUT
+          echo "uat_merge=$UAT_MERGE" >> $GITHUB_OUTPUT
 
-          CHANGED_FILES=$(git diff --name-only "$PARENT_UAT" "$MERGE")
+          # List changed files
+          CHANGED_FILES=$(git diff --name-only "$PARENT_UAT" "$UAT_MERGE")
           FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
 
@@ -98,7 +100,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
           echo "commit_messages<<EOF" >> $GITHUB_ENV
-          git log --oneline "$PARENT_UAT".."$MERGE"
+          git log --oneline "$PARENT_UAT".."$UAT_MERGE"
           echo "EOF" >> $GITHUB_ENV
 
       - name: Extract Jira ID
@@ -120,11 +122,11 @@ jobs:
 
           echo "jira_id=$JIRA" >> $GITHUB_ENV
 
-      - name: Check if commit already exists in PROD
+      - name: Check if changes already exist in PROD
         run: |
           git fetch origin prod
           if git merge-base --is-ancestor "${{ steps.validate.outputs.merge_commit }}" origin/prod; then
-            echo "Changes already exist in prod. Exiting workflow."
+            echo "Changes already exist in PROD. Exiting workflow."
             exit 0
           fi
 
@@ -136,12 +138,13 @@ jobs:
           git checkout -b "$BR" origin/prod
           echo "branch=$BR" >> $GITHUB_OUTPUT
 
-      - name: Apply UAT merge commit to PROD with conflict handling
+      - name: Apply PR changes to PROD
         id: apply
         run: |
-          UAT_MERGE="${{ steps.extract.outputs.uat_merge_commit }}"
+          PARENT="${{ steps.extract.outputs.parent_uat }}"
+          MERGE="${{ steps.extract.outputs.uat_merge }}"
 
-          if git cherry-pick -x "$UAT_MERGE"; then
+          if git cherry-pick "$PARENT".."$MERGE"; then
             echo "changes_applied=true" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -160,7 +163,7 @@ jobs:
           RESOLVED=true
           echo "$CONFLICTS" | while read line; do
             FILE=$(echo "$line" | cut -c4-)
-            git checkout "$UAT_MERGE" -- "$FILE" || RESOLVED=false
+            git checkout "$MERGE" -- "$FILE" || RESOLVED=false
             git add "$FILE"
           done
 
@@ -179,8 +182,8 @@ jobs:
         run: |
           {
             echo "Jira ID: ${{ env.jira_id }}"
-            echo "Source PR: #${{ steps.validate.outputs.pr_number }} (merged into uat)"
-            echo "Target branch: prod"
+            echo "Source PR: #${{ steps.validate.outputs.pr_number }} (merged into UAT)"
+            echo "Target branch: PROD"
             echo ""
             echo "Changes identified: ${{ steps.extract.outputs.file_count }} files"
             echo ""
@@ -203,7 +206,7 @@ jobs:
         if: steps.apply.outputs.changes_applied == 'true'
         run: |
           BR="${{ steps.create_branch.outputs.branch }}"
-          TITLE="[${{ env.jira_id }}] Promote changes from uat to prod"
+          TITLE="[${{ env.jira_id }}] Promote changes from UAT to PROD"
 
           PAYLOAD=$(jq -n \
             --arg title "$TITLE" \
