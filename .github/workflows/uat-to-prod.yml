@@ -1,4 +1,4 @@
-name: 4. Promote UAT → Production
+name: 4. Promote UAT → PROD
 
 on:
   workflow_dispatch:
@@ -34,48 +34,89 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Validate PR and get merge info
+      - name: Validate PR
         id: validate
         run: |
           PR="${{ github.event.inputs.pr_number }}"
-          
           PR_JSON=$(curl -s \
             -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}")
-          
-          MERGE_COMMIT=$(echo "$PR_JSON" | jq -r '.merge_commit_sha')
-          BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
-          MERGED=$(echo "$PR_JSON" | jq -r '.merged')
-          
-          if [ "$MERGED" != "true" ] || [ "$BASE_BRANCH" != "uat" ]; then
-            echo "Error: PR #$PR not merged into uat"
+
+          ERR=$(echo "$PR_JSON" | jq -r '.message // empty')
+          if [ -n "$ERR" ]; then
+            echo "PR not found. API message: $ERR"
             exit 1
           fi
-          
+
+          BASE=$(echo "$PR_JSON" | jq -r '.base.ref')
+          MERGED=$(echo "$PR_JSON" | jq -r '.merged')
+          MERGE_COMMIT=$(echo "$PR_JSON" | jq -r '.merge_commit_sha')
+
+          if [ "$MERGED" != "true" ]; then
+            echo "PR is not merged."
+            exit 1
+          fi
+
+          if [ "$BASE" != "uat" ]; then
+            echo "PR base branch must be uat."
+            exit 1
+          fi
+
+          if [ -z "$MERGE_COMMIT" ] || [ "$MERGE_COMMIT" = "null" ]; then
+            echo "Unable to detect merge commit."
+            exit 1
+          fi
+
           echo "pr_number=$PR" >> $GITHUB_OUTPUT
           echo "merge_commit=$MERGE_COMMIT" >> $GITHUB_OUTPUT
 
-      - name: Get parent commit and changes
+      - name: Extract Jira ID
+        run: |
+          PR_JSON=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.validate.outputs.pr_number }}")
+
+          TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          BODY=$(echo "$PR_JSON" | jq -r '.body')
+
+          JIRA_ID=$(echo "$TITLE" | grep -oE "\[?JIRA-[0-9]+\]?" | head -1 | tr -d '[]')
+          if [ -z "$JIRA_ID" ]; then
+            JIRA_ID=$(echo "$BODY" | grep -oE "JIRA-[0-9]+" | head -1)
+          fi
+          if [ -z "$JIRA_ID" ]; then
+            JIRA_ID="PR-${{ steps.validate.outputs.pr_number }}"
+          fi
+
+          echo "jira_id=$JIRA_ID" >> $GITHUB_ENV
+
+      - name: Get changes from merge commit
         id: get-changes
         run: |
-          # Get the UAT state before merge
-          git fetch origin uat
-          PARENT=$(git log --pretty=%P -n 1 "${{ steps.validate.outputs.merge_commit }}" | awk '{print $1}')
-          
-          echo "parent_commit=$PARENT" >> $GITHUB_OUTPUT
-          
-          # Get all changes in this merge
-          CHANGES=$(git diff --name-only "$PARENT" "${{ steps.validate.outputs.merge_commit }}")
-          echo "changed_files<<EOF" >> $GITHUB_ENV
-          echo "$CHANGES" >> $GITHUB_ENV
+          PARENT_UAT=$(git log --pretty=%P -n 1 "${{ steps.validate.outputs.merge_commit }}" | awk '{print $1}')
+          CHANGE_COMMIT=$(git log --no-merges --pretty=format:"%H" "$PARENT_UAT".."${{ steps.validate.outputs.merge_commit }}" | head -1)
+
+          echo "parent_commit=$PARENT_UAT" >> $GITHUB_OUTPUT
+          echo "change_commit=$CHANGE_COMMIT" >> $GITHUB_OUTPUT
+
+          echo "commit_messages<<EOF" >> $GITHUB_ENV
+          git log --oneline "$PARENT_UAT".."${{ steps.validate.outputs.merge_commit }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      - name: Check if changes already in Production
+          FILES=$(git diff --name-only "$PARENT_UAT" "${{ steps.validate.outputs.merge_commit }}")
+          COUNT=$(echo "$FILES" | wc -l | tr -d ' ')
+
+          echo "file_count=$COUNT" >> $GITHUB_OUTPUT
+          echo "changed_files<<EOF" >> $GITHUB_ENV
+          echo "$FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Check if changes already exist in prod
         run: |
-          git fetch origin main
-          if git merge-base --is-ancestor "${{ steps.validate.outputs.merge_commit }}" origin/main; then
-            echo "Changes already exist in Production."
+          git fetch origin prod
+          if git merge-base --is-ancestor "${{ steps.validate.outputs.merge_commit }}" origin/prod; then
+            echo "Changes already in prod."
             exit 0
           fi
 
@@ -83,61 +124,134 @@ jobs:
         id: create_branch
         run: |
           TS=$(date +%s)
-          BRANCH="promote/prod-pr${{ steps.validate.outputs.pr_number }}-${TS}"
-          git fetch origin main
-          git checkout -b "$BRANCH" origin/main
+          BRANCH="promote/${{ env.jira_id }}-pr${{ steps.validate.outputs.pr_number }}-${TS}"
+          git fetch origin prod
+          git checkout -b "$BRANCH" origin/prod
           echo "branch=$BRANCH" >> $GITHUB_OUTPUT
 
-      - name: Apply changes using merge-tree (Modern Approach)
+      - name: Apply changes
         id: apply_changes
         run: |
-          # Use git merge-tree to simulate merge without committing
-          echo "Merging changes from UAT to Production..."
-          
-          # Create a temporary merge
-          MERGE_RESULT=$(git merge-tree --write-tree origin/main "${{ steps.validate.outputs.merge_commit }}")
-          
-          if [ $? -eq 0 ]; then
-            # Successful merge
-            git reset --hard "$MERGE_RESULT"
-            git commit --allow-empty -m "Promote to production: PR #${{ steps.validate.outputs.pr_number }}"
+          if git cherry-pick -x "${{ steps.get-changes.outputs.change_commit }}"; then
             echo "changes_applied=true" >> $GITHUB_OUTPUT
-          else
-            # Handle conflicts
-            echo "Merge conflict detected"
-            
-            # Alternative: Create and apply patch
-            git diff "${{ steps.get-changes.outputs.parent_commit }}" \
-              "${{ steps.validate.outputs.merge_commit }}" > changes.patch
-            
-            if git apply --3way changes.patch; then
-              git add .
-              git commit -m "Promote to production: PR #${{ steps.validate.outputs.pr_number }}"
-              echo "changes_applied=true" >> $GITHUB_OUTPUT
-            else
-              echo "Failed to apply changes automatically"
-              echo "Manual intervention required"
-              echo "changes_applied=false" >> $GITHUB_OUTPUT
-              exit 1
-            fi
+            exit 0
           fi
 
-      - name: Push and create PR
+          CONFLICTS=$(git status --porcelain | grep -E '^(UU|AA)')
+          OTHER=$(git status --porcelain | grep -vE '^(UU|AA)')
+
+          if [ -n "$OTHER" ]; then
+            git cherry-pick --abort
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          RESOLVED=true
+          echo "$CONFLICTS" | while read line; do
+            STATUS=$(echo "$line" | cut -c1-2)
+            FILE=$(echo "$line" | cut -c4-)
+            case $STATUS in
+              "UU"|"AA")
+                git checkout "${{ steps.get-changes.outputs.change_commit }}" -- "$FILE" || RESOLVED=false
+                git add "$FILE"
+                ;;
+            esac
+          done
+
+          if [ "$RESOLVED" != "true" ]; then
+            git cherry-pick --abort
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          if git cherry-pick --continue; then
+            echo "changes_applied=true" >> $GITHUB_OUTPUT
+          else
+            git cherry-pick --abort
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Prepare PR body
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          {
+            echo "Jira ID: ${{ env.jira_id }}"
+            echo "Source PR: #${{ steps.validate.outputs.pr_number }} (merged into uat)"
+            echo "Target branch: prod"
+            echo ""
+            echo "Changed files:"
+            echo "${{ env.changed_files }}"
+            echo ""
+            echo "Commit messages:"
+            echo "${{ env.commit_messages }}"
+            echo ""
+            echo "A PR ID reference will be added below for future traceability."
+          } > body.txt
+
+      - name: Push branch
         if: steps.apply_changes.outputs.changes_applied == 'true'
         run: |
           git push origin "${{ steps.create_branch.outputs.branch }}"
-          
-          # Create PR
-          RESPONSE=$(curl -s -X POST \
+
+      - name: Create PR into prod
+        id: create_pr
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+          TITLE="[${{ env.jira_id }}] Promote changes from uat to prod"
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg head "$BR" \
+            --arg base "prod" \
+            --arg body "$(cat body.txt)" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          RESP=$(curl -s -X POST \
             -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
             -H "Content-Type: application/json" \
-            -d '{
-              "title": "Production Release: PR #'"${{ steps.validate.outputs.pr_number }}"'",
-              "head": "'"${{ steps.create_branch.outputs.branch }}"'",
-              "base": "main",
-              "body": "Promoting changes from UAT to Production\n\nSource PR: #'"${{ steps.validate.outputs.pr_number }}"'"
-            }' \
+            -d "$PAYLOAD" \
             "https://api.github.com/repos/${{ github.repository }}/pulls")
-          
-          PR_NUM=$(echo "$RESPONSE" | jq -r '.number')
-          echo "Created PR #$PR_NUM"
+
+          echo "$RESP" > pr.json
+
+          PRNUM=$(jq -r '.number' pr.json)
+          if [ "$PRNUM" = "null" ]; then
+            echo "Error creating PR: $(jq -r '.message' pr.json)"
+            exit 1
+          fi
+
+          echo "created_pr=$PRNUM" >> $GITHUB_OUTPUT
+
+      - name: Update PR body with PR ID
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+          {
+            cat body.txt
+            echo ""
+            echo "PR ID: $PR"
+            echo "Retain this ID for prod-level traceability."
+          } > updated_body.txt
+
+          PAYLOAD=$(jq -n --arg body "$(cat updated_body.txt)" '{body:$body}')
+
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}" > /dev/null
+
+      - name: Apply Jira and environment labels
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+          LABELS=$(jq -n --arg jira "${{ env.jira_id }}" '{labels: [$jira, "uat-to-prod"]}')
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$LABELS" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR}/labels"
+
