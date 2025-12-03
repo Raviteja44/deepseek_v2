@@ -1,0 +1,293 @@
+name: 3. Promote Dev → UAT
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number that was merged into dev"
+        required: true
+        type: number
+      source_branch:
+        description: "Source branch: dev"
+        required: true
+        type: choice
+        options:
+          - dev
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup environment
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR
+        id: validate
+        run: |
+          PR="${{ github.event.inputs.pr_number }}"
+          if [ -z "$PR" ]; then
+            echo "Error: PR number cannot be empty." >&2
+            exit 1
+          fi
+
+          PR_JSON=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}")
+
+          ERR=$(echo "$PR_JSON" | jq -r '.message // empty')
+          if [ -n "$ERR" ]; then
+            echo "Error: PR #$PR not found. API message: $ERR" >&2
+            exit 1
+          fi
+
+          BASE_BRANCH=$(echo "$PR_JSON" | jq -r '.base.ref')
+          MERGED=$(echo "$PR_JSON" | jq -r '.merged')
+          MERGE_COMMIT=$(echo "$PR_JSON" | jq -r '.merge_commit_sha')
+
+          if [ "$MERGED" != "true" ]; then
+            echo "Error: PR #$PR is not merged." >&2
+            exit 1
+          fi
+
+          if [ "$BASE_BRANCH" != "dev" ]; then
+            echo "Error: PR #$PR must have been merged into dev (found: $BASE_BRANCH)." >&2
+            exit 1
+          fi
+
+          if [ -z "$MERGE_COMMIT" ] || [ "$MERGE_COMMIT" = "null" ]; then
+            echo "Error: Could not get merge commit SHA for PR #$PR"
+            exit 1
+          fi
+
+          echo "pr_number=$PR" >> $GITHUB_OUTPUT
+          echo "merge_commit=$MERGE_COMMIT" >> $GITHUB_OUTPUT
+
+      - name: Extract Jira ID
+        run: |
+          PR_JSON=$(curl -s \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${{ steps.validate.outputs.pr_number }}")
+
+          TITLE=$(echo "$PR_JSON" | jq -r '.title')
+          BODY=$(echo "$PR_JSON" | jq -r '.body')
+
+          JIRA_ID=$(echo "$TITLE" | grep -oE "\[?JIRA-[0-9]+\]?" | head -1 | tr -d '[]' || echo "")
+          if [ -z "$JIRA_ID" ]; then
+            JIRA_ID=$(echo "$BODY" | grep -oE "JIRA-[0-9]+" | head -1 || echo "")
+          fi
+          if [ -z "$JIRA_ID" ]; then
+            JIRA_ID="PR-${{ steps.validate.outputs.pr_number }}"
+          fi
+
+          echo "jira_id=$JIRA_ID" >> $GITHUB_ENV
+
+      - name: Get changes from merge commit
+        id: get-changes
+        run: |
+          PARENT_DEV=$(git log --pretty=%P -n 1 "${{ steps.validate.outputs.merge_commit }}" | awk '{print $1}')
+          FEATURE_COMMIT=$(git log --no-merges --pretty=format:"%H" "$PARENT_DEV".."${{ steps.validate.outputs.merge_commit }}" | head -1)
+
+          echo "parent_commit=$PARENT_DEV" >> $GITHUB_OUTPUT
+          echo "feature_commit=$FEATURE_COMMIT" >> $GITHUB_OUTPUT
+
+          echo "commit_messages<<EOF" >> $GITHUB_ENV
+          git log --oneline "$PARENT_DEV".."${{ steps.validate.outputs.merge_commit }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+          CHANGED_FILES=$(git diff --name-only "$PARENT_DEV" "${{ steps.validate.outputs.merge_commit }}")
+          FILE_COUNT=$(echo "$CHANGED_FILES" | wc -l | tr -d ' ')
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+
+          echo "changed_files<<EOF" >> $GITHUB_ENV
+          echo "$CHANGED_FILES" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Check if changes already in UAT
+        run: |
+          git fetch origin uat
+          if git merge-base --is-ancestor "${{ steps.validate.outputs.merge_commit }}" origin/uat; then
+            echo "Changes already exist in UAT. Exiting workflow."
+            exit 0
+          fi
+
+      - name: Create promotion branch
+        id: create_branch
+        run: |
+          TS=$(date +%s)
+          BRANCH="promote/${{ env.jira_id }}-pr${{ steps.validate.outputs.pr_number }}-${TS}"
+          git fetch origin uat
+          git checkout -b "$BRANCH" origin/uat
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Apply changes with basic conflict handling
+        id: apply_changes
+        run: |
+          echo "Applying feature commit to UAT..."
+
+          if git cherry-pick -x "${{ steps.get-changes.outputs.feature_commit }}"; then
+            echo "changes_applied=true" >> $GITHUB_OUTPUT
+            echo "conflict_resolved=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Cherry-pick resulted in conflicts. Checking for common conflict types."
+
+          CONFLICTS=$(git status --porcelain | grep -E '^(UU|AA)')
+          OTHER_CONFLICTS=$(git status --porcelain | grep -vE '^(UU|AA)')
+
+          if [ -n "$OTHER_CONFLICTS" ]; then
+            echo "Conflicts could not be resolved automatically and require manual intervention."
+            git cherry-pick --abort
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "Resolving conflicts of types: UU, AA."
+
+          RESOLVED=true
+
+          echo "$CONFLICTS" | while read line; do
+            STATUS=$(echo "$line" | cut -c1-2)
+            FILE=$(echo "$line" | cut -c4-)
+
+            case $STATUS in
+              "UU"|"AA")
+                git checkout "${{ steps.get-changes.outputs.feature_commit }}" -- "$FILE" || RESOLVED=false
+                git add "$FILE"
+                ;;
+            esac
+          done
+
+          if [ "$RESOLVED" != "true" ]; then
+            echo "Conflicts could not be resolved automatically and require manual intervention."
+            git cherry-pick --abort
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          if git cherry-pick --continue; then
+            echo "Cherry-pick completed after resolving common conflicts."
+            echo "changes_applied=true" >> $GITHUB_OUTPUT
+            echo "conflict_resolved=true" >> $GITHUB_OUTPUT
+          else
+            echo "Conflicts could not be resolved automatically and require manual intervention."
+            git cherry-pick --abort
+            echo "changes_applied=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Prepare PR body
+        id: prepare_body
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          JIRA="${{ env.jira_id }}"
+          PRNUM="${{ steps.validate.outputs.pr_number }}"
+          FILES="${{ env.changed_files }}"
+          MESSAGES="${{ env.commit_messages }}"
+          COUNT="${{ steps.get-changes.outputs.file_count }}"
+
+          {
+            echo "Jira ID: $JIRA"
+            echo "Source PR: #$PRNUM (merged into dev)"
+            echo "Target branch: uat"
+            echo ""
+            echo "Changes identified: $COUNT files"
+            echo ""
+            echo "Changed files:"
+            echo "$FILES"
+            echo ""
+            echo "Commit messages:"
+            echo "$MESSAGES"
+            echo ""
+            echo "A PR ID reference will be added below for future uat → prod promotions."
+          } > body.txt
+
+      - name: Push branch
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          git push origin "${{ steps.create_branch.outputs.branch }}"
+
+      - name: Create PR into uat
+        id: create_pr
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          BR="${{ steps.create_branch.outputs.branch }}"
+          JIRA_ID="${{ env.jira_id }}"
+          TITLE="[${JIRA_ID}] Promote changes from dev to uat"
+
+          PAYLOAD=$(jq -n \
+            --arg title "$TITLE" \
+            --arg head "$BR" \
+            --arg base "uat" \
+            --arg body "$(cat body.txt)" \
+            '{title:$title, head:$head, base:$base, body:$body}')
+
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls")
+
+          echo "$RESPONSE" > created.json
+
+          PR_NUM=$(jq -r '.number' created.json)
+          if [ "$PR_NUM" = "null" ]; then
+            echo "Error creating PR: $(jq -r '.message' created.json)" >&2
+            exit 1
+          fi
+
+          echo "created_pr=$PR_NUM" >> $GITHUB_OUTPUT
+
+      - name: Update PR body with PR ID
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+          UPDATED=updated_body.txt
+
+          cat body.txt > "$UPDATED"
+          echo "" >> "$UPDATED"
+          echo "PR ID: $PR" >> "$UPDATED"
+          echo "Retain this ID for uat → prod promotions." >> "$UPDATED"
+
+          PAYLOAD=$(jq -n --arg body "$(cat $UPDATED)" '{body:$body}')
+
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls/${PR}" > /dev/null
+
+      - name: Apply Jira and environment labels
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          PR="${{ steps.create_pr.outputs.created_pr }}"
+          JIRA_ID="${{ env.jira_id }}"
+
+          LABELS=$(jq -n --arg jira "$JIRA_ID" '{labels: [$jira, "dev-to-uat"]}')
+
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.PAT_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$LABELS" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR}/labels"
+
+      - name: Completed
+        if: steps.apply_changes.outputs.changes_applied == 'true'
+        run: |
+          echo "Promotion Dev → UAT completed successfully."
+          echo "Created PR: #${{ steps.create_pr.outputs.created_pr }}"
