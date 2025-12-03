@@ -1,10 +1,10 @@
-name: 4. Promote UAT → PROD
+name: 3. Promote UAT → PROD
 
 on:
   workflow_dispatch:
     inputs:
       pr_number:
-        description: "PR number that was merged into uat"
+        description: "PR number that was merged into UAT"
         required: true
         type: number
       source_branch:
@@ -70,26 +70,23 @@ jobs:
           echo "merge_commit=$MERGE_COMMIT" >> $GITHUB_OUTPUT
           echo "pr_number=$PR" >> $GITHUB_OUTPUT
 
-      - name: Validate commit exists in dev & uat
+      - name: Validate commit exists in UAT
         run: |
-          git fetch origin dev
           git fetch origin uat
-
           COMMIT="${{ steps.validate.outputs.merge_commit }}"
 
           if ! git merge-base --is-ancestor "$COMMIT" origin/uat; then
-            echo "Error: This change does not exist in uat branch."
+            echo "Error: The merge commit does not exist in uat branch."
             exit 1
           fi
 
-      - name: Extract feature commit & changes
+      - name: Extract UAT merge commit changes
         id: extract
         run: |
           MERGE="${{ steps.validate.outputs.merge_commit }}"
           PARENT_UAT=$(git log --pretty=%P -n 1 "$MERGE" | awk '{print $1}')
-          FEATURE_COMMIT=$(git log --no-merges --pretty=format:"%H" "$PARENT_UAT".."$MERGE" | head -1)
 
-          echo "feature_commit=$FEATURE_COMMIT" >> $GITHUB_OUTPUT
+          echo "uat_merge_commit=$MERGE" >> $GITHUB_OUTPUT
           echo "parent_uat=$PARENT_UAT" >> $GITHUB_OUTPUT
 
           CHANGED_FILES=$(git diff --name-only "$PARENT_UAT" "$MERGE")
@@ -123,7 +120,7 @@ jobs:
 
           echo "jira_id=$JIRA" >> $GITHUB_ENV
 
-      - name: Check if commit already exists in prod
+      - name: Check if commit already exists in PROD
         run: |
           git fetch origin prod
           if git merge-base --is-ancestor "${{ steps.validate.outputs.merge_commit }}" origin/prod; then
@@ -139,46 +136,41 @@ jobs:
           git checkout -b "$BR" origin/prod
           echo "branch=$BR" >> $GITHUB_OUTPUT
 
-      - name: Apply changes with conflict handling
+      - name: Apply UAT merge commit to PROD with conflict handling
         id: apply
         run: |
-          if git cherry-pick -x "${{ steps.extract.outputs.feature_commit }}"; then
+          UAT_MERGE="${{ steps.extract.outputs.uat_merge_commit }}"
+
+          if git cherry-pick -x "$UAT_MERGE"; then
             echo "changes_applied=true" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "Conflicts detected. Checking for common conflict types."
+          echo "Conflicts detected. Attempting automatic resolution for UU/AA conflicts."
 
           CONFLICTS=$(git status --porcelain | grep -E '^(UU|AA)')
           OTHER=$(git status --porcelain | grep -vE '^(UU|AA)')
 
           if [ -n "$OTHER" ]; then
-            echo "Conflicts could not be resolved automatically and require manual intervention."
+            echo "Conflicts could not be resolved automatically. Manual intervention required."
             git cherry-pick --abort
             exit 1
           fi
-
-          echo "Resolving conflicts of types: UU, AA."
 
           RESOLVED=true
           echo "$CONFLICTS" | while read line; do
             FILE=$(echo "$line" | cut -c4-)
-            git checkout "${{ steps.extract.outputs.feature_commit }}" -- "$FILE" || RESOLVED=false
+            git checkout "$UAT_MERGE" -- "$FILE" || RESOLVED=false
             git add "$FILE"
           done
 
           if [ "$RESOLVED" != "true" ]; then
-            echo "Conflicts could not be resolved automatically and require manual intervention."
+            echo "Conflicts could not be resolved automatically. Manual intervention required."
             git cherry-pick --abort
             exit 1
           fi
 
-          if ! git cherry-pick --continue; then
-            echo "Conflicts could not be resolved automatically and require manual intervention."
-            git cherry-pick --abort
-            exit 1
-          fi
-
+          git cherry-pick --continue
           echo "changes_applied=true" >> $GITHUB_OUTPUT
 
       - name: Prepare PR body
@@ -198,7 +190,7 @@ jobs:
             echo "Commit messages:"
             echo "${{ env.commit_messages }}"
             echo ""
-            echo "A PR ID reference is included below and can be used to identify the exact changes deployed into production."
+            echo "PR ID reference below can be used to identify the exact changes deployed into production."
           } > body.txt
 
       - name: Push promotion branch
@@ -206,7 +198,7 @@ jobs:
         run: |
           git push origin "${{ steps.create_branch.outputs.branch }}"
 
-      - name: Create PR into prod
+      - name: Create PR into PROD
         id: create_pr
         if: steps.apply.outputs.changes_applied == 'true'
         run: |
