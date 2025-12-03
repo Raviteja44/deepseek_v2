@@ -14,7 +14,3 @@ INSERT INTO test_users VALUES (3, 'P Ravi', 'pravi@example.com');
 
 INSERT INTO test_users VALUES (4, 'P Teja', 'pteja@example.com');
 
---test 1
---test 2
---test 4
---test 3
