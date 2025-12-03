@@ -1,0 +1,20 @@
+---First test
+
+CREATE TABLE test_users (
+    id INT PRIMARY KEY,
+    name VARCHAR(100),
+    email VARCHAR(100)
+);
+
+
+INSERT INTO test_users VALUES (1, 'John Rawl', 'johnrawl@example.com');
+INSERT INTO test_users VALUES (2, 'John Roe', 'johnroe@example.com');
+
+INSERT INTO test_users VALUES (3, 'P Ravi', 'pravi@example.com');
+
+INSERT INTO test_users VALUES (4, 'P Teja', 'pteja@example.com');
+
+--test 1
+--test 2
+--test 4
+--test 3
