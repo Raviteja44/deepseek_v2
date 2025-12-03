@@ -77,11 +77,6 @@ jobs:
 
           COMMIT="${{ steps.validate.outputs.merge_commit }}"
 
-          if ! git merge-base --is-ancestor "$COMMIT" origin/dev; then
-            echo "Error: This change does not exist in dev branch."
-            exit 1
-          fi
-
           if ! git merge-base --is-ancestor "$COMMIT" origin/uat; then
             echo "Error: This change does not exist in uat branch."
             exit 1
